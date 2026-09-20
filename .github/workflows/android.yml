@@ -159,7 +159,7 @@ jobs:
         env:
           GH_ABOUT_APP_WORKFLOW_TOKEN: ${{ secrets.GH_ABOUT_APP_WORKFLOW_TOKEN }}
         run: |
-          git checkout host
+          git checkout main
           git config --global user.name "Sketchware Pro Actions"
           git config --global user.email "hello@sketchware.pro"
           git add about.json
