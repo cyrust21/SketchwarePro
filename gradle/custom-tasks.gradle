@@ -1,21 +1,23 @@
 /**
  * Creates a mock google-services.json if GOOGLE_SERVICES_JSON environment variable is absent.
+ * Logika dijalankan pada fase konfigurasi agar plugin Google Services mendeteksi file lebih awal.
  */
-tasks.register('createMockGoogleServices') {
-    doLast {
-        def secrets = System.getenv("GOOGLE_SERVICES_JSON")
-        if (secrets != null && !secrets.trim().isEmpty()) {
-            new File("$projectDir/google-services.json").text = secrets
-            return
-        }
-        def rootMockFile = file("google-services.json")
-        if (rootMockFile.exists() && rootMockFile.length() == 0) {
-            rootMockFile.delete()
-        }
-        def mockFile = file("src/debug/google-services.json")
-        if (!mockFile.exists()) {
-            mockFile.parentFile.mkdirs()
-            def mockContent = """{
+
+def secrets = System.getenv("GOOGLE_SERVICES_JSON")
+def rootMockFile = file("google-services.json")
+
+// 1. Cek apakah ada rahasia (secrets) dari environment GitHub Actions
+if (secrets != null && !secrets.trim().isEmpty()) {
+    rootMockFile.text = secrets
+} else {
+    // 2. Jika tidak ada rahasia, pastikan tidak ada file kosong yang mengganggu
+    if (rootMockFile.exists() && rootMockFile.length() == 0) {
+        rootMockFile.delete()
+    }
+    
+    // 3. Buat file dummy (palsu) tepat di direktori app/ (bukan di debug/)
+    if (!rootMockFile.exists()) {
+        def mockContent = """{
   "project_info": {
     "project_number": "123456789000",
     "firebase_url": "https://mock-project-default-rtdb.firebaseio.com",
@@ -45,8 +47,14 @@ tasks.register('createMockGoogleServices') {
   ],
   "configuration_version": "1"
 }"""
-            mockFile.text = mockContent
-        }
+        rootMockFile.text = mockContent
+    }
+}
+
+// Mempertahankan struktur task agar preBuild.dependsOn tidak error
+tasks.register('createMockGoogleServices') {
+    doLast {
+        println "Pengecekan google-services.json berhasil diselesaikan pada fase konfigurasi."
     }
 }
 
