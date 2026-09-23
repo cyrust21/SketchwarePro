@@ -31,9 +31,11 @@ class DependencyResolver(
     private val artifactId: String,
     private val version: String,
     private val skipDependencies: Boolean,
-    private val buildSettings: BuildSettings
+    private val buildSettings: BuildSettings,
+    private val minAPILevel: Int // <-- Parameter minAPILevel ditambahkan
 ) {
     companion object {
+        // Dikembalikan agar tidak error saat inisialisasi repositories.json
         private val DEFAULT_REPOS = """
           |[
           |    {"url": "https://repo.hortonworks.com/content/repositories/releases", "name": "HortanWorks"},
@@ -125,34 +127,24 @@ class DependencyResolver(
         val dependencyClasspath = mutableListOf<Path>()
 
         val classpath = buildSettings.getValue(BuildSettings.SETTING_CLASSPATH, "")
-
         classpath.split(":").forEach {
             if (it.isEmpty()) return@forEach
             dependencyClasspath.add(Paths.get(it))
         }
 
+        // 1. Download & unzip (kalau aar) artifact utama dulu — TAPI BELUM di-dex
         dependency.downloadTo(
             File(downloadPath + "/${dependency.artifactId}-v${dependency.version}/classes.${dependency.extension}")
-                .apply {
-                    parentFile?.mkdirs()
-                }
+                .apply { parentFile?.mkdirs() }
         )
 
         if (dependency.extension == "aar") {
             callback.unzipping(dependency)
             unzip(
-                Paths.get(
-                    downloadPath,
-                    "${dependency.artifactId}-v${dependency.version}",
-                    "classes.aar"
-                )
+                Paths.get(downloadPath, "${dependency.artifactId}-v${dependency.version}", "classes.aar")
             )
             Files.delete(
-                Paths.get(
-                    downloadPath,
-                    "${dependency.artifactId}-v${dependency.version}",
-                    "classes.aar"
-                )
+                Paths.get(downloadPath, "${dependency.artifactId}-v${dependency.version}", "classes.aar")
             )
             val packageName = findPackageName(
                 Paths.get(downloadPath, "${dependency.artifactId}-v${dependency.version}")
@@ -164,28 +156,28 @@ class DependencyResolver(
         }
 
         val jar = Paths.get(
-            downloadPath,
-            "${dependency.artifactId}-v${dependency.version}",
-            "classes.jar"
+            downloadPath, "${dependency.artifactId}-v${dependency.version}", "classes.jar"
         )
 
-        callback.dexing(dependency)
-        try {
-            compileJar(jar, dependencyClasspath, libraryJars)
-            callback.onResolutionComplete(dependency)
-        } catch (e: Exception) {
-            callback.dexingFailed(dependency, e)
-        }
-
+        // 2. Kalau skip sub-dependency, dex artifact utama sekarang juga & selesai
         if (skipDependencies) {
+            callback.dexing(dependency)
+            try {
+                compileJar(jar, dependencyClasspath, libraryJars)
+                callback.onResolutionComplete(dependency)
+            } catch (e: Exception) {
+                callback.dexingFailed(dependency, e)
+                return@runBlocking
+            }
             callback.onSkippingResolution(dependency)
             callback.onTaskCompleted(listOf("${dependency.artifactId}-v${dependency.version}"))
             return@runBlocking
         }
+
+        // 3. Resolve & DOWNLOAD semua sub-dependency DULU, isi classpath lengkap
         dependency.resolveDependencyTree()
 
         dependency.getAllDependencies().forEach { dep ->
-            println("Resolving dependency: ${dep.artifactId} v${dep.version}")
             if (dep.extension != "jar" && dep.extension != "aar") {
                 callback.invalidPackaging(dep)
                 return@forEach
@@ -196,12 +188,7 @@ class DependencyResolver(
                 return@forEach
             }
 
-            val path = Paths.get(
-                downloadPath,
-                "${dep.artifactId}-v${dep.version}",
-                "classes.${dep.extension}"
-            )
-
+            val path = Paths.get(downloadPath, "${dep.artifactId}-v${dep.version}", "classes.${dep.extension}")
             Files.createDirectories(path.parent)
 
             dep.downloadTo(File(path.toString()))
@@ -210,29 +197,39 @@ class DependencyResolver(
                 callback.unzipping(dep)
                 unzip(path)
                 Files.delete(path)
-                val packageName =
-                    findPackageName(path.parent.toAbsolutePath().toString(), dep.groupId)
+                val packageName = findPackageName(path.parent.toAbsolutePath().toString(), dep.groupId)
                 path.parent.resolve("config").writeText(packageName)
             }
 
-            val jar = if (dep.extension == "jar") path else Paths.get(
+            val depJar = if (dep.extension == "jar") path else Paths.get(
                 downloadPath, "${dep.artifactId}-v${dep.version}", "classes.jar"
             )
-            if (Files.notExists(jar)) {
+            if (Files.notExists(depJar)) {
                 callback.onDependenciesNotFound(dep)
                 return@forEach
             }
 
-            dependencyClasspath.add(jar)
+            dependencyClasspath.add(depJar)
         }
 
+        // 4. BARU SEKARANG dex artifact utama — classpath-nya udah lengkap sama semua sub-dependency
+        callback.dexing(dependency)
+        try {
+            compileJar(jar, dependencyClasspath, libraryJars)
+            callback.onResolutionComplete(dependency)
+        } catch (e: Exception) {
+            callback.dexingFailed(dependency, e)
+            return@runBlocking
+        }
+
+        // 5. Dex tiap sub-dependency (masing-masing pake classpath dari SEMUA jar lain minus dirinya sendiri)
         dependency.getAllDependencies().forEach { dep ->
-            val jar = Paths.get(downloadPath, "${dep.artifactId}-v${dep.version}", "classes.jar")
+            val depJar = Paths.get(downloadPath, "${dep.artifactId}-v${dep.version}", "classes.jar")
 
             callback.dexing(dep)
             try {
                 compileJar(
-                    jar, dependencyClasspath.toMutableList().apply { remove(jar) }, libraryJars
+                    depJar, dependencyClasspath.toMutableList().apply { remove(depJar) }, libraryJars
                 )
                 callback.onResolutionComplete(dep)
             } catch (e: Exception) {
@@ -242,19 +239,19 @@ class DependencyResolver(
         }
 
         callback.onTaskCompleted(
-            dependency.getAllDependencies().map { "${it.artifactId}-v${it.version}" })
+            listOf("${dependency.artifactId}-v${dependency.version}") +
+                dependency.getAllDependencies().map { "${it.artifactId}-v${it.version}" }
+        )
     }
 
     private fun findPackageName(path: String, defaultValue: String): String {
-        val manifest =
-            File(path).walk().filter { it.isFile && it.name == "AndroidManifest.xml" }.firstOrNull()
+        val manifest = File(path).walk().filter { it.isFile && it.name == "AndroidManifest.xml" }.firstOrNull()
         val content = manifest?.readText() ?: return defaultValue
         val p = Pattern.compile("<manifest.*package=\"(.*?)\"", Pattern.DOTALL)
         val m = p.matcher(content)
         if (m.find()) {
             return m.group(1)!!
         }
-
         return defaultValue
     }
 
@@ -282,6 +279,7 @@ class DependencyResolver(
         D8.run(
             D8Command.builder().setIntermediate(true).setMode(CompilationMode.RELEASE)
                 .addProgramFiles(jarFile).addLibraryFiles(libraryJars).addClasspathFiles(jars)
+                .setMinApiLevel(minAPILevel) // <-- Set minAPILevel ditambahkan ke D8
                 .setOutput(jarFile.parent, OutputMode.DexIndexed).build()
         )
     }
